@@ -48,3 +48,6 @@ manual_*.bin
 
 # Claude Code
 .claude/
+
+# Log files
+*.log
