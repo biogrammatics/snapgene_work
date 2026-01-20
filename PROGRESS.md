@@ -18,42 +18,44 @@ The `twist_to_snapgene.py` script generates SnapGene .dna files from Twist synth
 
 3. **History structure** - Shows replace operation with parent/child nodes
    - Root node: Final construct with `operation="replace"`
-   - Child node: Backbone vector with features and HistoryColors
+   - Child node: Backbone vector with features, HistoryColors, and `resurrectable="2"`
 
-### Known Issue: History Child Node Not Clickable
+4. **Type 11 Manipulation packet** - Required for clickable history nodes
+   - Each restorable history node needs a corresponding Type 11 packet
+   - Type 11 contains undo/redo actions linking node states
+   - The packet's node_id (bytes 0-3 of header) must match the child node's ID
 
-The child node in the history tree is not clickable/openable in SnapGene.
+### Type 11 Manipulation Packet Structure
 
-**What we've tried:**
-- Adding `resurrectable="2"` attribute - didn't work
-- Removing `operation` attribute from child - didn't work
-- Matching exact structure from manually-created working file - didn't work
-- Even when user manually deleted grandchild nodes in SnapGene, child still wasn't clickable
+The Type 11 packet is critical for making history nodes clickable/restorable:
 
-**Working example (pJAG v2 s5-bLee-Hi.dna) structure:**
-```xml
-<Node name="pJAG v2.dna" ... ID="5" operation="replace">
-  <Node name="pJAG v2.dna" ... ID="4" resurrectable="2">
-    <Features>...</Features>
-    <HistoryColors>...</HistoryColors>
-  </Node>
-</Node>
+```
+Header (9 bytes):
+  Bytes 0-3: Node ID (big-endian u32) - must match history node ID
+  Bytes 4-8: Unknown flags (observed: 0x1d000002d4)
+
+Content (XZ compressed XML):
+<Manipulation>
+  <AdditionalSequenceProperties>...</AdditionalSequenceProperties>
+  <Redo>
+    <Action type="REMOVE" range="start-end"/>
+    <Action type="INSERT" position="start">
+      <Residues type="GENERIC" residues="SEQUENCE"/>
+    </Action>
+  </Redo>
+  <Undo>
+    <Action type="REMOVE" range="start-new_end"/>
+    <Action type="INSERT" position="start">
+      <Residues type="EXTERNAL" length="old_length" ID="0"/>
+    </Action>
+  </Undo>
+</Manipulation>
 ```
 
-**Our generated structure (test_denovo.dna):**
-```xml
-<Node name="pJAG v2.dna" ... ID="3" operation="replace">
-  <Node name="pJAG v2.dna" ... ID="2">
-    <Features>...</Features>
-    <HistoryColors>...</HistoryColors>
-  </Node>
-</Node>
-```
-
-The structures look similar but behavior differs. May be related to:
-- How the file was originally created (manual cloning vs script generation)
-- Some other packet or metadata we're not aware of
-- Internal SnapGene state not stored in the file
+- **Redo**: Actions to transform from child state to root state
+- **Undo**: Actions to transform from root state back to child state
+- `GENERIC` residues contain the actual sequence data
+- `EXTERNAL` residues reference externally stored sequences
 
 ### Key Technical Details
 
@@ -63,7 +65,7 @@ The structures look similar but behavior differs. May be related to:
 - Use 0x03 for circular double-stranded DNA
 
 **Packets we copy from backbone:**
-- Type 3, 11, 16: Enzyme cache data
+- Type 3, 16: Enzyme cache data
 - Type 13: Display settings
 - Type 14, 28: Custom enzyme sets and visibilities
 - Type 35: Unknown (XZ compressed)
@@ -73,15 +75,62 @@ The structures look similar but behavior differs. May be related to:
 - Type 6: Notes with new name/UUID
 - Type 7: History tree (XZ compressed)
 - Type 10: Features XML
+- Type 11: New manipulation packet for replace operation
 - Type 17: Empty AlignableSequences
 
 **Packets we skip:**
 - Type 27: BAM alignment data
+- Backbone's Type 11 packets (they reference old node IDs)
 
 ### Files
 
 - `twist_to_snapgene.py` - Main converter script
 - `pJAG v2.dna` - Backbone vector (4841 bp)
 - `pJAG v2 s5-bLee-Hi.dna` - Manually created working example
+- `test_denovo.dna` - Generated test output
+- `SNAPGENE_FORMAT.md` - Binary format documentation
+
+### Testing Status
+
+**Working** - Child node is clickable and resurrection correctly restores the backbone with all features.
+
+### Critical Limitation: Type 11 Template Requirement
+
+**Python's lzma library produces XZ streams that SnapGene cannot correctly parse for resurrection.**
+
+Even with identical XML content, the compressed output differs from SnapGene's native compression, causing resurrection to fail (wrong sequence, garbage appended, missing features).
+
+**Solution**: Use a template file created manually in SnapGene.
+
+The `type11_template_path` parameter in `generate_twist_construct()` extracts the XZ stream and EXTERNAL data from an existing .dna file and uses it verbatim (only updating the node ID in the header).
+
+**Template requirements**:
+- Must be a .dna file created by manually performing the same operation in SnapGene
+- The operation must be at the same insertion site (e.g., replacing the 300 bp Stuffer/AarI region)
+- The template defines what backbone will be restored on resurrection
+- The template is **NOT** generic - it's tied to the specific operation and backbone
+
+**Example usage**:
+```python
+generate_twist_construct(
+    final_sequence=my_sequence,
+    backbone_path="pJAG v2.dna",
+    insert_start=1715,
+    insert_end=2014,
+    construct_name="My Construct",
+    orf_name="MyProtein",
+    signal_peptide=SecretionSignal.S5,
+    output_path="output.dna",
+    type11_template_path="pJAG v2 s5-bLee-Hi.dna"  # Manually created template
+)
+```
+
+**Without a template**: History will show the replace operation, but clicking the child node will not properly restore the backbone sequence and features.
+
+### Files
+
+- `twist_to_snapgene.py` - Main converter script
+- `pJAG v2.dna` - Backbone vector (4841 bp)
+- `pJAG v2 s5-bLee-Hi.dna` - Working manual example (use as template)
 - `test_denovo.dna` - Generated test output
 - `SNAPGENE_FORMAT.md` - Binary format documentation

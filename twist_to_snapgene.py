@@ -19,6 +19,7 @@ import lzma
 import re
 import os
 import html
+import hashlib
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Optional
@@ -393,6 +394,174 @@ def create_his_tag_feature(start: int, end: int, orf_end: int) -> dict:
     }
 
 
+def build_external_data_from_file(external_data_path: str) -> bytes:
+    """
+    Load pre-built EXTERNAL data from a binary file.
+
+    This is used when we have a known-working EXTERNAL data structure
+    that we want to reuse (e.g., extracted from a manually-created file).
+    """
+    with open(external_data_path, 'rb') as f:
+        return f.read()
+
+
+def build_external_data(
+    old_sequence: str,
+    backbone_packets: list,
+    external_template_path: str = None,
+) -> bytes:
+    """
+    Build the EXTERNAL reference data for a Type 11 manipulation packet.
+
+    The EXTERNAL data contains:
+    1. A 112-byte header with sequence metadata
+    2. XZ-compressed packets (features, notes, etc.)
+
+    Args:
+        old_sequence: The sequence being stored (the backbone stuffer region)
+        backbone_packets: List of (type, data) tuples from the backbone file
+        external_template_path: Optional path to a pre-built EXTERNAL data file
+    """
+    # If we have a template file, use it directly
+    if external_template_path and os.path.exists(external_template_path):
+        return build_external_data_from_file(external_template_path)
+
+    seq_len = len(old_sequence)
+
+    # Build the 112-byte header
+    # Copy the exact structure from a working manual file, only changing seq_len
+    # Header format reverse-engineered from pJAG v2 s5-bLee-Hi.dna
+    header = bytearray(112)
+
+    # First 32 bytes: metadata (little-endian except seq_len which is big-endian)
+    struct.pack_into('<I', header, 0, 31)         # 0x1f
+    struct.pack_into('<I', header, 4, 102)        # 0x66
+    struct.pack_into('<I', header, 8, 256)        # 0x100
+    struct.pack_into('<I', header, 12, 23808)     # 0x5d00
+    struct.pack_into('<I', header, 16, 142337)    # 0x22c01
+    struct.pack_into('<I', header, 20, 65536)     # 0x10000
+    struct.pack_into('<I', header, 24, 16777216)  # 0x1000000
+    struct.pack_into('>I', header, 28, seq_len)   # sequence length (big-endian)
+
+    # Bytes 32-111: Copy exact bytes from working file (80 bytes)
+    # These appear to be binary data, possibly checksum or sequence encoding
+    # Using the exact pattern from the working manual file
+    manual_header_tail = bytes.fromhex(
+        '6311f306a82d8469b41badf91beaa5b3b1d6966a7a6a82d7fd590a1ab67a0ada'
+        'd559492ea846ead6699656679974f1e8ab6ab3162bff4e9bb131a556146a56d6'
+        'e549998495e82e0f30bb251e00001694'
+    )
+    header[32:112] = manual_header_tail
+
+    # Build the inner packet data - only include specific packet types
+    # Based on reverse engineering: 16, 17, 27, 8, 10, 5, 6, 14, 28
+    allowed_types = {16, 17, 27, 8, 10, 5, 6, 14, 28}
+    inner_packets = []
+    for ptype, pdata in backbone_packets:
+        if ptype not in allowed_types:
+            continue
+        inner_packets.append(make_packet(ptype, pdata))
+
+    inner_data = b''.join(inner_packets)
+
+    # Compress the inner packet data
+    inner_compressed = lzma.compress(inner_data)
+
+    return bytes(header) + inner_compressed
+
+
+def extract_type11_from_dna_file(dna_path: str) -> tuple:
+    """
+    Extract the XZ stream and EXTERNAL data from an existing .dna file's Type 11 packet.
+
+    Returns:
+        Tuple of (xz_stream_bytes, external_data_bytes, original_node_id)
+    """
+    with open(dna_path, 'rb') as f:
+        data = f.read()
+
+    for ptype, pdata in extract_all_packets(data):
+        if ptype == 11:
+            node_id = struct.unpack('>I', pdata[:4])[0]
+            xz_data = pdata[9:]
+
+            # Find XZ stream end (YZ marker)
+            xz_end = None
+            for i in range(len(xz_data) - 2):
+                if xz_data[i:i+2] == b'YZ':
+                    xz_end = i + 2
+                    break
+
+            if xz_end is None:
+                raise ValueError(f"Could not find XZ end marker in {dna_path}")
+
+            xz_stream = xz_data[:xz_end]
+            external_data = xz_data[xz_end:]
+
+            return xz_stream, external_data, node_id
+
+    raise ValueError(f"No Type 11 packet found in {dna_path}")
+
+
+def build_manipulation_packet(
+    node_id: int,
+    replace_start: int,
+    replace_end: int,
+    new_sequence: str,
+    old_sequence: str,
+    backbone_packets: list = None,
+    template_dna_path: str = None,
+) -> bytes:
+    """
+    Build a Type 11 manipulation packet for a replace operation.
+
+    This packet is required for history nodes to be clickable/restorable.
+    It contains the undo/redo actions to navigate between the parent and child states.
+
+    Args:
+        node_id: The history node ID this manipulation corresponds to (child node)
+        replace_start: Start of replaced region (1-based, will be converted to 0-based)
+        replace_end: End of replaced region (1-based)
+        new_sequence: The new sequence inserted at replace_start (for Redo INSERT)
+        old_sequence: The original sequence that was replaced (for Undo INSERT)
+        backbone_packets: List of (type, data) tuples from backbone for EXTERNAL reference
+        template_dna_path: Path to existing .dna file to extract XZ stream and EXTERNAL data from
+    """
+    # Build header (9 bytes):
+    # Bytes 0-3: Node ID (big-endian u32)
+    # Bytes 4-8: Flags (observed: 0x1d000002d4)
+    header = struct.pack('>I', node_id) + bytes([0x1d, 0x00, 0x00, 0x02, 0xd4])
+
+    # If we have a template file, use its XZ stream and EXTERNAL data
+    # This ensures compatibility since Python's lzma produces different output than SnapGene's
+    if template_dna_path and os.path.exists(template_dna_path):
+        xz_stream, external_data, _ = extract_type11_from_dna_file(template_dna_path)
+        return header + xz_stream + external_data
+
+    # Fallback: build our own (may not work for resurrection)
+    # Convert to 0-based positions (SnapGene Type 11 uses 0-based like history ColorRange)
+    replace_start_0 = replace_start - 1
+
+    # The new sequence end position (0-based, inclusive)
+    new_end_0 = replace_start_0 + len(new_sequence) - 1
+    old_end_0 = replace_start_0 + len(old_sequence) - 1
+
+    # Build the Manipulation XML
+    manipulation_xml = f'''<?xml version="1.0" encoding="UTF-8"?><Manipulation><AdditionalSequenceProperties><UpstreamStickiness>0</UpstreamStickiness><DownstreamStickiness>0</DownstreamStickiness><UpstreamModification>FivePrimePhosphorylated</UpstreamModification><DownstreamModification>FivePrimePhosphorylated</DownstreamModification></AdditionalSequenceProperties><Redo><Action type="REMOVE" range="{replace_start_0}-{old_end_0}"/><Action type="INSERT" position="{replace_start_0}"><Residues type="GENERIC" residues="{new_sequence}"/></Action></Redo><Undo><Action type="REMOVE" range="{replace_start_0}-{new_end_0}"/><Action type="INSERT" position="{replace_start_0}"><Residues type="EXTERNAL" length="{len(old_sequence)}" ID="0"/></Action></Undo></Manipulation>
+'''
+
+    # Compress the manipulation XML with LZMA
+    compressed_xml = lzma.compress(manipulation_xml.encode('utf-8'))
+
+    # Build the EXTERNAL data for the Undo action
+    if backbone_packets is not None:
+        external_data = build_external_data(old_sequence, backbone_packets)
+    else:
+        external_data = b''
+
+    return header + compressed_xml + external_data
+
+
 def build_history_tree(
     final_name: str,
     final_seq_len: int,
@@ -404,7 +573,7 @@ def build_history_tree(
     insert_length: int,
     existing_history: str = None,
     backbone_features_xml: str = None,
-) -> str:
+) -> tuple:
     """
     Build a History Tree XML showing a replacement operation.
 
@@ -460,13 +629,13 @@ def build_history_tree(
     # Build HistoryColors for child node (Input colors showing replaced region)
     child_history_colors = f'<HistoryColors><StrandColors type="Input"><TopStrand><ColorRange range="{replace_start_0}..{replace_end}" colors="white"/></TopStrand><BottomStrand><ColorRange range="{replace_start_0}..{replace_end}" colors="white"/></BottomStrand></StrandColors></HistoryColors>'
 
-    # Create simple child node - NO resurrectable attribute, NO operation attribute
-    # Just the node with features and colors - this is what SnapGene produces
-    child_content = f'<Node name="{backbone_name}" type="DNA" seqLen="{backbone_seq_len}" strandedness="double" ID="{child_id}" circular="{circular}">{features_content}{child_history_colors}</Node>'
+    # Create child node with resurrectable="2" to make it clickable/openable
+    child_content = f'<Node name="{backbone_name}" type="DNA" seqLen="{backbone_seq_len}" strandedness="double" ID="{child_id}" circular="{circular}" resurrectable="2">{features_content}{child_history_colors}</Node>'
 
     history = f'''<?xml version="1.0" encoding="UTF-8"?><HistoryTree><Node name="{final_name}" type="DNA" seqLen="{final_seq_len}" strandedness="double" ID="{new_root_id}" circular="{circular}" operation="replace"><HistoryColors><StrandColors type="Product"><TopStrand><ColorRange range="{replace_start_0}..{insert_end_final}" colors="red"/></TopStrand><BottomStrand><ColorRange range="{replace_start_0}..{insert_end_final}" colors="red"/></BottomStrand></StrandColors></HistoryColors><InputSummary manipulation="replace" val1="{replace_start_0}" val2="{replace_end}"/>{child_content}</Node></HistoryTree>'''
 
-    return history
+    # Return both history XML and child_id (needed for Type 11 manipulation packet)
+    return history, child_id
 
 
 def make_display_settings(
@@ -540,6 +709,7 @@ def generate_twist_construct(
     orf_name: str = "ORF",
     signal_peptide: Optional[SecretionSignal] = None,
     output_path: str = None,
+    type11_template_path: str = None,
 ) -> str:
     """
     Generate a SnapGene .dna file for a Twist construct.
@@ -562,6 +732,8 @@ def generate_twist_construct(
         orf_name: Name for the ORF feature
         signal_peptide: Optional secretion signal to detect
         output_path: Output file path (default: construct_name.dna)
+        type11_template_path: Path to existing .dna file to use as Type 11 template
+                             (required for working history resurrection)
     """
     if output_path is None:
         output_path = f"{construct_name}.dna"
@@ -691,7 +863,7 @@ def generate_twist_construct(
 
     # Build history tree - wraps existing backbone history with our replace operation
     # The final construct uses the backbone name (SnapGene convention)
-    history_xml = build_history_tree(
+    history_xml, child_node_id = build_history_tree(
         final_name=backbone_name,  # SnapGene keeps the backbone name
         final_seq_len=len(final_sequence),
         is_circular=is_circular,
@@ -706,6 +878,34 @@ def generate_twist_construct(
 
     # Compress history
     history_compressed = lzma.compress(history_xml.encode('utf-8'))
+
+    # Build Type 11 manipulation packet for the replace operation
+    # This links to the child node and is required for it to be clickable/restorable
+    #
+    # IMPORTANT: Type 11 ranges are END-INCLUSIVE in 0-based coordinates
+    # The REMOVE range will be "(insert_start-1)-(insert_end)" in 0-based
+    # Example: insert_start=940, insert_end=1238 -> range "939-1238"
+    # This covers 1238 - 939 + 1 = 300 positions (0-based indices 939..1238 inclusive)
+    #
+    # old_length = (insert_end) - (insert_start - 1) + 1 = insert_end - insert_start + 2
+    # new_length = final_len - backbone_len + old_length
+    type11_old_length = insert_end - (insert_start - 1) + 1  # = insert_end - insert_start + 2
+    type11_new_length = len(final_sequence) - len(backbone_seq) + type11_old_length
+    type11_new_sequence = final_sequence[insert_start-1:insert_start-1+type11_new_length]
+    type11_old_sequence = backbone_seq[insert_start-1:insert_start-1+type11_old_length]
+
+    # Get all backbone packets for the EXTERNAL reference in Type 11
+    backbone_packets = extract_all_packets(backbone_data)
+
+    manipulation_data = build_manipulation_packet(
+        node_id=child_node_id,
+        replace_start=insert_start,
+        replace_end=insert_end,
+        new_sequence=type11_new_sequence,
+        old_sequence=type11_old_sequence,
+        backbone_packets=backbone_packets,
+        template_dna_path=type11_template_path,
+    )
 
     # Build new file by copying ALL packets from backbone, replacing only what's needed
     # This preserves enzyme cache, display settings, and other UI state
@@ -751,9 +951,16 @@ def generate_twist_construct(
         elif packet_type == 27:
             # Skip BAM alignment data - not relevant for new construct
             pass
+        elif packet_type == 11:
+            # Skip backbone's Type 11 manipulation packets - we'll add our own
+            # The backbone's packets reference old node IDs and sequence positions
+            pass
         else:
-            # Copy all other packets unchanged (3, 5, 8, 9, 11, 13, 14, 16, 28, 35, etc.)
+            # Copy all other packets unchanged (3, 5, 8, 9, 13, 14, 16, 28, 35, etc.)
             packets.append(make_packet(packet_type, packet_data))
+
+    # Add our new Type 11 manipulation packet (for the replace operation)
+    packets.append(make_packet(11, manipulation_data))
 
     # Write file
     with open(output_path, 'wb') as f:
