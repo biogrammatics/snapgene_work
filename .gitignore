@@ -39,5 +39,12 @@ Thumbs.db
 test*.dna
 !synthetic_plasmid.dna
 
+# Debug/working files
+*.bin
+manual_*.bin
+
+# Template files (user-specific, created manually in SnapGene)
+*s5-bLee*.dna
+
 # Claude Code
 .claude/
