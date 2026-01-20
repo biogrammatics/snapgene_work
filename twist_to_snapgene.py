@@ -19,10 +19,11 @@ import lzma
 import re
 import os
 import html
-import hashlib
+import argparse
 from datetime import datetime, timezone
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
+from pathlib import Path
 import uuid
 
 
@@ -94,6 +95,52 @@ SECRETION_SIGNALS = {
 
 # His tag sequence
 HIS_TAG_6X = "HHHHHH"
+
+
+@dataclass
+class VectorConfig:
+    """Configuration for a backbone vector."""
+    name: str                    # Display name (e.g., "pJAG v2")
+    backbone_path: str           # Path to backbone .dna file (relative to DATA_DIR)
+    insert_start: int            # Start of insertion site (1-based)
+    insert_end: int              # End of insertion site (1-based)
+    template_path: str = None    # Path to Type 11 template .dna file (relative to DATA_DIR)
+    default_signal: str = None   # Default secretion signal key (from SECRETION_SIGNALS)
+
+
+# Default data directory for vector files
+# Can be overridden by setting SNAPGENE_DATA_DIR environment variable
+DATA_DIR = Path(os.environ.get("SNAPGENE_DATA_DIR", "~/snapgene_data")).expanduser()
+
+
+def resolve_data_path(relative_path: str) -> Path:
+    """Resolve a path relative to DATA_DIR, or return as-is if absolute."""
+    path = Path(relative_path)
+    if path.is_absolute():
+        return path
+    return DATA_DIR / path
+
+
+# Registered vectors
+# Add new vectors here with their insertion site coordinates and template files
+VECTORS: dict[str, VectorConfig] = {
+    "pJAG_v2": VectorConfig(
+        name="pJAG v2",
+        backbone_path="pJAG v2.dna",
+        insert_start=1715,
+        insert_end=2014,
+        template_path="pJAG v2 s5-bLee-Hi.dna",
+        default_signal="s5",
+    ),
+    # Add more vectors as needed:
+    # "pYES2": VectorConfig(
+    #     name="pYES2",
+    #     backbone_path="pYES2.dna",
+    #     insert_start=...,
+    #     insert_end=...,
+    #     template_path="pYES2_template.dna",
+    # ),
+}
 
 
 def make_packet(packet_type: int, data: bytes) -> bytes:
@@ -394,82 +441,6 @@ def create_his_tag_feature(start: int, end: int, orf_end: int) -> dict:
     }
 
 
-def build_external_data_from_file(external_data_path: str) -> bytes:
-    """
-    Load pre-built EXTERNAL data from a binary file.
-
-    This is used when we have a known-working EXTERNAL data structure
-    that we want to reuse (e.g., extracted from a manually-created file).
-    """
-    with open(external_data_path, 'rb') as f:
-        return f.read()
-
-
-def build_external_data(
-    old_sequence: str,
-    backbone_packets: list,
-    external_template_path: str = None,
-) -> bytes:
-    """
-    Build the EXTERNAL reference data for a Type 11 manipulation packet.
-
-    The EXTERNAL data contains:
-    1. A 112-byte header with sequence metadata
-    2. XZ-compressed packets (features, notes, etc.)
-
-    Args:
-        old_sequence: The sequence being stored (the backbone stuffer region)
-        backbone_packets: List of (type, data) tuples from the backbone file
-        external_template_path: Optional path to a pre-built EXTERNAL data file
-    """
-    # If we have a template file, use it directly
-    if external_template_path and os.path.exists(external_template_path):
-        return build_external_data_from_file(external_template_path)
-
-    seq_len = len(old_sequence)
-
-    # Build the 112-byte header
-    # Copy the exact structure from a working manual file, only changing seq_len
-    # Header format reverse-engineered from pJAG v2 s5-bLee-Hi.dna
-    header = bytearray(112)
-
-    # First 32 bytes: metadata (little-endian except seq_len which is big-endian)
-    struct.pack_into('<I', header, 0, 31)         # 0x1f
-    struct.pack_into('<I', header, 4, 102)        # 0x66
-    struct.pack_into('<I', header, 8, 256)        # 0x100
-    struct.pack_into('<I', header, 12, 23808)     # 0x5d00
-    struct.pack_into('<I', header, 16, 142337)    # 0x22c01
-    struct.pack_into('<I', header, 20, 65536)     # 0x10000
-    struct.pack_into('<I', header, 24, 16777216)  # 0x1000000
-    struct.pack_into('>I', header, 28, seq_len)   # sequence length (big-endian)
-
-    # Bytes 32-111: Copy exact bytes from working file (80 bytes)
-    # These appear to be binary data, possibly checksum or sequence encoding
-    # Using the exact pattern from the working manual file
-    manual_header_tail = bytes.fromhex(
-        '6311f306a82d8469b41badf91beaa5b3b1d6966a7a6a82d7fd590a1ab67a0ada'
-        'd559492ea846ead6699656679974f1e8ab6ab3162bff4e9bb131a556146a56d6'
-        'e549998495e82e0f30bb251e00001694'
-    )
-    header[32:112] = manual_header_tail
-
-    # Build the inner packet data - only include specific packet types
-    # Based on reverse engineering: 16, 17, 27, 8, 10, 5, 6, 14, 28
-    allowed_types = {16, 17, 27, 8, 10, 5, 6, 14, 28}
-    inner_packets = []
-    for ptype, pdata in backbone_packets:
-        if ptype not in allowed_types:
-            continue
-        inner_packets.append(make_packet(ptype, pdata))
-
-    inner_data = b''.join(inner_packets)
-
-    # Compress the inner packet data
-    inner_compressed = lzma.compress(inner_data)
-
-    return bytes(header) + inner_compressed
-
-
 def extract_type11_from_dna_file(dna_path: str) -> tuple:
     """
     Extract the XZ stream and EXTERNAL data from an existing .dna file's Type 11 packet.
@@ -503,63 +474,36 @@ def extract_type11_from_dna_file(dna_path: str) -> tuple:
     raise ValueError(f"No Type 11 packet found in {dna_path}")
 
 
-def build_manipulation_packet(
-    node_id: int,
-    replace_start: int,
-    replace_end: int,
-    new_sequence: str,
-    old_sequence: str,
-    backbone_packets: list = None,
-    template_dna_path: str = None,
-) -> bytes:
+def build_manipulation_packet(node_id: int, template_dna_path: str) -> bytes:
     """
     Build a Type 11 manipulation packet for a replace operation.
 
     This packet is required for history nodes to be clickable/restorable.
     It contains the undo/redo actions to navigate between the parent and child states.
 
+    NOTE: A template file (created manually in SnapGene) is REQUIRED because
+    Python's lzma library produces XZ streams that SnapGene cannot correctly
+    parse for resurrection.
+
     Args:
         node_id: The history node ID this manipulation corresponds to (child node)
-        replace_start: Start of replaced region (1-based, will be converted to 0-based)
-        replace_end: End of replaced region (1-based)
-        new_sequence: The new sequence inserted at replace_start (for Redo INSERT)
-        old_sequence: The original sequence that was replaced (for Undo INSERT)
-        backbone_packets: List of (type, data) tuples from backbone for EXTERNAL reference
         template_dna_path: Path to existing .dna file to extract XZ stream and EXTERNAL data from
     """
+    if not template_dna_path or not os.path.exists(template_dna_path):
+        raise ValueError(
+            "A Type 11 template file is required for working history resurrection. "
+            "Create a template by manually performing the same cloning operation in SnapGene."
+        )
+
     # Build header (9 bytes):
     # Bytes 0-3: Node ID (big-endian u32)
     # Bytes 4-8: Flags (observed: 0x1d000002d4)
     header = struct.pack('>I', node_id) + bytes([0x1d, 0x00, 0x00, 0x02, 0xd4])
 
-    # If we have a template file, use its XZ stream and EXTERNAL data
+    # Extract XZ stream and EXTERNAL data from template
     # This ensures compatibility since Python's lzma produces different output than SnapGene's
-    if template_dna_path and os.path.exists(template_dna_path):
-        xz_stream, external_data, _ = extract_type11_from_dna_file(template_dna_path)
-        return header + xz_stream + external_data
-
-    # Fallback: build our own (may not work for resurrection)
-    # Convert to 0-based positions (SnapGene Type 11 uses 0-based like history ColorRange)
-    replace_start_0 = replace_start - 1
-
-    # The new sequence end position (0-based, inclusive)
-    new_end_0 = replace_start_0 + len(new_sequence) - 1
-    old_end_0 = replace_start_0 + len(old_sequence) - 1
-
-    # Build the Manipulation XML
-    manipulation_xml = f'''<?xml version="1.0" encoding="UTF-8"?><Manipulation><AdditionalSequenceProperties><UpstreamStickiness>0</UpstreamStickiness><DownstreamStickiness>0</DownstreamStickiness><UpstreamModification>FivePrimePhosphorylated</UpstreamModification><DownstreamModification>FivePrimePhosphorylated</DownstreamModification></AdditionalSequenceProperties><Redo><Action type="REMOVE" range="{replace_start_0}-{old_end_0}"/><Action type="INSERT" position="{replace_start_0}"><Residues type="GENERIC" residues="{new_sequence}"/></Action></Redo><Undo><Action type="REMOVE" range="{replace_start_0}-{new_end_0}"/><Action type="INSERT" position="{replace_start_0}"><Residues type="EXTERNAL" length="{len(old_sequence)}" ID="0"/></Action></Undo></Manipulation>
-'''
-
-    # Compress the manipulation XML with LZMA
-    compressed_xml = lzma.compress(manipulation_xml.encode('utf-8'))
-
-    # Build the EXTERNAL data for the Undo action
-    if backbone_packets is not None:
-        external_data = build_external_data(old_sequence, backbone_packets)
-    else:
-        external_data = b''
-
-    return header + compressed_xml + external_data
+    xz_stream, external_data, _ = extract_type11_from_dna_file(template_dna_path)
+    return header + xz_stream + external_data
 
 
 def build_history_tree(
@@ -881,29 +825,8 @@ def generate_twist_construct(
 
     # Build Type 11 manipulation packet for the replace operation
     # This links to the child node and is required for it to be clickable/restorable
-    #
-    # IMPORTANT: Type 11 ranges are END-INCLUSIVE in 0-based coordinates
-    # The REMOVE range will be "(insert_start-1)-(insert_end)" in 0-based
-    # Example: insert_start=940, insert_end=1238 -> range "939-1238"
-    # This covers 1238 - 939 + 1 = 300 positions (0-based indices 939..1238 inclusive)
-    #
-    # old_length = (insert_end) - (insert_start - 1) + 1 = insert_end - insert_start + 2
-    # new_length = final_len - backbone_len + old_length
-    type11_old_length = insert_end - (insert_start - 1) + 1  # = insert_end - insert_start + 2
-    type11_new_length = len(final_sequence) - len(backbone_seq) + type11_old_length
-    type11_new_sequence = final_sequence[insert_start-1:insert_start-1+type11_new_length]
-    type11_old_sequence = backbone_seq[insert_start-1:insert_start-1+type11_old_length]
-
-    # Get all backbone packets for the EXTERNAL reference in Type 11
-    backbone_packets = extract_all_packets(backbone_data)
-
     manipulation_data = build_manipulation_packet(
         node_id=child_node_id,
-        replace_start=insert_start,
-        replace_end=insert_end,
-        new_sequence=type11_new_sequence,
-        old_sequence=type11_old_sequence,
-        backbone_packets=backbone_packets,
         template_dna_path=type11_template_path,
     )
 
@@ -972,32 +895,191 @@ def generate_twist_construct(
     return output_path
 
 
+def generate_from_vector(
+    vector_name: str,
+    final_sequence: str,
+    construct_name: str,
+    orf_name: str = "ORF",
+    signal_peptide: Union[str, SecretionSignal, None] = None,
+    output_path: str = None,
+) -> str:
+    """
+    Generate a SnapGene .dna file using a registered vector configuration.
+
+    This is the recommended high-level function for most use cases.
+
+    Args:
+        vector_name: Key from VECTORS registry (e.g., "pJAG_v2")
+        final_sequence: The complete final DNA sequence
+        construct_name: Name for the final construct
+        orf_name: Name for the ORF feature
+        signal_peptide: Secretion signal - can be:
+            - None: Use vector's default signal (if any)
+            - str: Key from SECRETION_SIGNALS (e.g., "s5", "alpha_factor")
+            - SecretionSignal: Custom signal peptide object
+        output_path: Output file path (default: construct_name.dna)
+
+    Returns:
+        Path to the generated .dna file
+
+    Example:
+        generate_from_vector(
+            vector_name="pJAG_v2",
+            final_sequence="ATGCAG...",
+            construct_name="My Protein",
+            orf_name="MyProtein",
+        )
+    """
+    if vector_name not in VECTORS:
+        available = ", ".join(VECTORS.keys())
+        raise ValueError(f"Unknown vector '{vector_name}'. Available: {available}")
+
+    vector = VECTORS[vector_name]
+
+    # Resolve signal peptide
+    if signal_peptide is None and vector.default_signal:
+        signal_peptide = vector.default_signal
+
+    if isinstance(signal_peptide, str):
+        if signal_peptide not in SECRETION_SIGNALS:
+            available = ", ".join(SECRETION_SIGNALS.keys())
+            raise ValueError(f"Unknown signal peptide '{signal_peptide}'. Available: {available}")
+        signal_peptide = SECRETION_SIGNALS[signal_peptide]
+
+    # Resolve paths
+    backbone_path = resolve_data_path(vector.backbone_path)
+    template_path = resolve_data_path(vector.template_path) if vector.template_path else None
+
+    return generate_twist_construct(
+        final_sequence=final_sequence,
+        backbone_path=str(backbone_path),
+        insert_start=vector.insert_start,
+        insert_end=vector.insert_end,
+        construct_name=construct_name,
+        orf_name=orf_name,
+        signal_peptide=signal_peptide,
+        output_path=output_path,
+        type11_template_path=str(template_path) if template_path else None,
+    )
+
+
+def list_vectors():
+    """Print available vectors and their configurations."""
+    print("Available vectors:")
+    print("-" * 60)
+    for key, vec in VECTORS.items():
+        print(f"  {key}:")
+        print(f"    Name: {vec.name}")
+        print(f"    Backbone: {vec.backbone_path}")
+        print(f"    Insert site: {vec.insert_start}-{vec.insert_end}")
+        if vec.template_path:
+            print(f"    Template: {vec.template_path}")
+        if vec.default_signal:
+            print(f"    Default signal: {vec.default_signal}")
+        print()
+
+
+def list_signals():
+    """Print available secretion signals."""
+    print("Available secretion signals:")
+    print("-" * 60)
+    for key, sig in SECRETION_SIGNALS.items():
+        print(f"  {key}:")
+        print(f"    Name: {sig.name}")
+        print(f"    Sequence: {sig.aa_sequence}")
+        print()
+
+
 def main():
-    """Example usage."""
-    print("Twist to SnapGene Converter")
-    print("=" * 40)
-    print()
-    print("Usage:")
-    print("  from twist_to_snapgene import generate_twist_construct, SecretionSignal")
-    print()
-    print("  # Define your secretion signal (optional)")
-    print("  alpha_factor = SecretionSignal('alpha factor', 'MRFPSIFTAVLFAASSALA')")
-    print()
-    print("  # Generate the construct")
-    print("  generate_twist_construct(")
-    print("      final_sequence='ATGC...',  # Full final sequence from Twist")
-    print("      backbone_path='my_vector.dna',")
-    print("      insert_start=940,  # Where insert begins in backbone (1-based)")
-    print("      insert_end=1238,   # Where stuffer ends in backbone (1-based)")
-    print("      construct_name='My Construct',")
-    print("      orf_name='Client Protein',")
-    print("      signal_peptide=alpha_factor,  # Optional")
-    print("  )")
-    print()
-    print("The history will show:")
-    print("  - Backbone vector as parent (with all original features)")
-    print("  - Replaced region highlighted in white (input) / red (product)")
-    print("  - ORF features are added to the final construct, not shown in history")
+    """Command-line interface for twist_to_snapgene."""
+    parser = argparse.ArgumentParser(
+        description="Convert Twist synthesis output to SnapGene .dna files",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Generate using a registered vector (recommended)
+  %(prog)s --vector pJAG_v2 --sequence ATGCAG... --name "My Protein"
+
+  # Read sequence from file
+  %(prog)s --vector pJAG_v2 --sequence-file insert.txt --name "My Protein"
+
+  # List available vectors
+  %(prog)s --list-vectors
+
+  # List available secretion signals
+  %(prog)s --list-signals
+
+Environment:
+  SNAPGENE_DATA_DIR  Directory containing vector and template files
+                     (default: ~/snapgene_data)
+""",
+    )
+
+    # Info commands
+    parser.add_argument("--list-vectors", action="store_true",
+                        help="List available vector configurations")
+    parser.add_argument("--list-signals", action="store_true",
+                        help="List available secretion signals")
+
+    # Main parameters
+    parser.add_argument("--vector", "-v", metavar="NAME",
+                        help=f"Vector name (available: {', '.join(VECTORS.keys())})")
+    parser.add_argument("--sequence", "-s", metavar="SEQ",
+                        help="Final DNA sequence")
+    parser.add_argument("--sequence-file", "-f", metavar="FILE",
+                        help="File containing the final DNA sequence")
+    parser.add_argument("--name", "-n", metavar="NAME",
+                        help="Construct name")
+    parser.add_argument("--orf-name", metavar="NAME", default="ORF",
+                        help="ORF feature name (default: ORF)")
+    parser.add_argument("--signal", metavar="NAME",
+                        help=f"Secretion signal (available: {', '.join(SECRETION_SIGNALS.keys())})")
+    parser.add_argument("--output", "-o", metavar="FILE",
+                        help="Output file path (default: <name>.dna)")
+
+    args = parser.parse_args()
+
+    # Handle info commands
+    if args.list_vectors:
+        list_vectors()
+        return
+
+    if args.list_signals:
+        list_signals()
+        return
+
+    # Validate required arguments for generation
+    if not args.vector:
+        parser.error("--vector is required for generation")
+    if not args.name:
+        parser.error("--name is required for generation")
+    if not args.sequence and not args.sequence_file:
+        parser.error("Either --sequence or --sequence-file is required")
+
+    # Get sequence
+    if args.sequence_file:
+        with open(args.sequence_file, 'r') as f:
+            sequence = f.read()
+    else:
+        sequence = args.sequence
+
+    # Clean sequence (remove whitespace, newlines)
+    sequence = ''.join(sequence.split()).upper()
+
+    # Generate
+    try:
+        output_path = generate_from_vector(
+            vector_name=args.vector,
+            final_sequence=sequence,
+            construct_name=args.name,
+            orf_name=args.orf_name,
+            signal_peptide=args.signal,
+            output_path=args.output,
+        )
+        print(f"Successfully generated: {output_path}")
+    except Exception as e:
+        print(f"Error: {e}")
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':
