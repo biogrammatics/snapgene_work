@@ -20,6 +20,7 @@ import re
 import os
 import html
 import argparse
+import json
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -86,15 +87,85 @@ class SecretionSignal:
             self.short_name = self.name.split()[0]
 
 
-# Common yeast secretion signals
-SECRETION_SIGNALS = {
-    "alpha_factor": SecretionSignal("alpha factor", "MRFPSIFTAVLFAASSALA", "alpha factor"),
-    "alpha_factor_prepro": SecretionSignal("alpha factor prepro", "MRFPSIFTAVLFAASSALAAPVNTTTEDETAQIPAEAVIGYSDLEGDFDVAVLPFSNSTNNGLLFINTTIASIAAKEEGVSLEKREAEA", "alpha factor prepro"),
-    "s5": SecretionSignal("Sc AGA2 signal peptide", "MQLLRCFSIFSVIASVLA", "s5"),
-}
+# =============================================================================
+# Configuration Loading
+# =============================================================================
 
-# His tag sequence
-HIS_TAG_6X = "HHHHHH"
+# Path to external configuration file
+CONFIG_FILE = Path(__file__).parent / "signals_and_tags.json"
+
+
+def load_config() -> dict:
+    """Load signals and tags from external JSON configuration file."""
+    if not CONFIG_FILE.exists():
+        raise FileNotFoundError(
+            f"Configuration file not found: {CONFIG_FILE}\n"
+            "This file should contain secretion_signals and tags definitions."
+        )
+    with open(CONFIG_FILE, 'r') as f:
+        return json.load(f)
+
+
+def load_secretion_signals() -> dict:
+    """
+    Load secretion signals from configuration file.
+
+    Returns dict of signal_key -> SecretionSignal objects.
+    Signals are sorted by sequence length (longest first) for proper detection.
+    """
+    config = load_config()
+    signals = {}
+
+    for key, data in config.get("secretion_signals", {}).items():
+        if key.startswith("_"):  # Skip comment fields
+            continue
+        signals[key] = SecretionSignal(
+            name=data["name"],
+            aa_sequence=data["sequence"],
+            short_name=data.get("short_name", key),
+            color=data.get("color", "#3366ff"),
+        )
+
+    # Sort by sequence length (longest first) for proper detection
+    sorted_signals = dict(
+        sorted(signals.items(), key=lambda x: -len(x[1].aa_sequence))
+    )
+    return sorted_signals
+
+
+def load_tags() -> dict:
+    """Load affinity/detection tags from configuration file."""
+    config = load_config()
+    tags = {}
+
+    for key, data in config.get("tags", {}).items():
+        if key.startswith("_"):
+            continue
+        tags[key] = data["sequence"]
+
+    return tags
+
+
+def load_naming_rules() -> dict:
+    """Load naming rules from configuration file."""
+    config = load_config()
+    rules = config.get("naming_rules", {})
+
+    # Flatten the nested structure for easy lookup
+    flat_rules = {}
+    for category in ["signals", "codon_variants", "tags", "proteins"]:
+        if category in rules:
+            flat_rules.update(rules[category])
+
+    return flat_rules
+
+
+# Load configuration at module import time
+SECRETION_SIGNALS = load_secretion_signals()
+TAGS = load_tags()
+
+# Backwards compatibility
+HIS_TAG_6X = TAGS.get("6xHis", "HHHHHH")
 
 
 @dataclass
@@ -132,13 +203,15 @@ VECTORS: dict[str, VectorConfig] = {
         template_path="pJAG v2 s5-bLee-Hi.dna",
         default_signal="s5",
     ),
-    # Add more vectors as needed:
-    # "pYES2": VectorConfig(
-    #     name="pYES2",
-    #     backbone_path="pYES2.dna",
-    #     insert_start=...,
-    #     insert_end=...,
-    #     template_path="pYES2_template.dna",
+    # pSAN vector - needs configuration once template file is available
+    # Uncomment and fill in insert_start, insert_end, and template_path
+    # "pSAN": VectorConfig(
+    #     name="pSAN",
+    #     backbone_path="pSAN.dna",
+    #     insert_start=1,     # TODO: Find BsaI insertion site start
+    #     insert_end=1,       # TODO: Find BsaI insertion site end
+    #     template_path="pSAN_template.dna",  # Manually created in SnapGene
+    #     default_signal=None,  # No default signal (varies per construct)
     # ),
 }
 
@@ -963,6 +1036,354 @@ def generate_from_vector(
     )
 
 
+# =============================================================================
+# CSV Import and ORF Detection
+# =============================================================================
+
+@dataclass
+class TwistConstruct:
+    """Parsed construct from Twist CSV."""
+    name: str                   # Twist name (e.g., "pSAN-s3bPhi_Ea1h-6xH")
+    vector_name: str            # Vector name from CSV (e.g., "pSAN")
+    insert_sequence: str        # Insert DNA sequence
+    construct_sequence: str     # Full construct DNA sequence
+    insert_length: int
+    construct_length: int
+    status: str                 # "delivered" or "failed"
+    shipping_est: str           # Estimated shipping date
+
+    # Parsed components (filled by analyze_construct)
+    signal_type: str = None     # Detected signal type (e.g., "s1", "s3", "s5", None)
+    codon_variant: str = None   # Codon variant (e.g., "b", "c")
+    protein_name: str = None    # Protein name extracted from Twist name
+    c_terminal_tag: str = None  # C-terminal tag (e.g., "6xH")
+    display_name: str = None    # Human-readable name
+    orf_name: str = None        # Name for ORF feature
+
+
+# Load naming rules from configuration file
+# These convert Twist-compatible names (no spaces) to human-readable display names
+NAMING_RULES = load_naming_rules()
+
+
+def detect_signal_peptide(protein_sequence: str) -> Optional[tuple]:
+    """
+    Detect which signal peptide is present at the N-terminus.
+
+    Returns:
+        Tuple of (signal_key, SecretionSignal) or None if no match
+    """
+    for key, signal in SECRETION_SIGNALS.items():
+        if protein_sequence.startswith(signal.aa_sequence):
+            return (key, signal)
+    return None
+
+
+def detect_his_tag(protein_sequence: str) -> bool:
+    """Check if protein has C-terminal 6xHis tag."""
+    return protein_sequence.rstrip('*').endswith(HIS_TAG_6X)
+
+
+def validate_orf(dna_sequence: str) -> tuple:
+    """
+    Validate that sequence is a valid ORF.
+
+    Returns:
+        Tuple of (is_valid, protein_sequence, error_message)
+    """
+    seq = dna_sequence.upper()
+
+    # Check for ATG start
+    if not seq.startswith('ATG'):
+        return (False, None, f"ORF does not start with ATG (starts with {seq[:3]})")
+
+    # Translate
+    protein = translate(seq)
+
+    # Check for stop codon
+    if '*' not in protein:
+        return (False, protein, "ORF does not contain a stop codon")
+
+    # Check stop is at end (allowing trailing sequence from vector)
+    stop_pos = protein.index('*')
+    if stop_pos < len(protein) - 1:
+        # There's sequence after the stop - this is OK for inserts
+        protein = protein[:stop_pos + 1]
+
+    return (True, protein, None)
+
+
+def parse_twist_name(name: str) -> dict:
+    """
+    Parse a Twist construct name into components.
+
+    Examples:
+        "pSAN-s3bPhi_Ea1h-6xH" -> {
+            'vector': 'pSAN',
+            'signal': 's3',
+            'codon': 'b',
+            'protein': 'Phi_Ea1h',
+            'tag': '6xH'
+        }
+        "pSANna-bProA" -> {
+            'vector': 'pSAN',
+            'signal': None,
+            'codon': 'b',
+            'protein': 'ProA',
+            'tag': None
+        }
+    """
+    result = {
+        'vector': None,
+        'signal': None,
+        'codon': None,
+        'protein': None,
+        'tag': None,
+    }
+
+    # Split by hyphens
+    parts = name.split('-')
+    if not parts:
+        return result
+
+    # First part is vector (may include 'na' for no signal)
+    vector_part = parts[0]
+    if vector_part.endswith('na'):
+        result['vector'] = vector_part[:-2]
+        result['signal'] = None
+    else:
+        result['vector'] = vector_part
+
+    if len(parts) < 2:
+        return result
+
+    # Second part contains: signal code + codon variant + protein name
+    middle = parts[1]
+
+    # Extract signal type (s1, s2, s3, s5, etc.)
+    signal_match = re.match(r'^(s\d+)([bc]?)(.*)$', middle)
+    if signal_match:
+        result['signal'] = signal_match.group(1)
+        result['codon'] = signal_match.group(2) or 'b'
+        result['protein'] = signal_match.group(3)
+    else:
+        # No signal prefix, might be "na" case or just codon+protein
+        codon_match = re.match(r'^([bc])(.*)$', middle)
+        if codon_match:
+            result['codon'] = codon_match.group(1)
+            result['protein'] = codon_match.group(2)
+        else:
+            result['protein'] = middle
+
+    # Third part (if present) is C-terminal tag
+    if len(parts) >= 3:
+        result['tag'] = parts[2]
+
+    return result
+
+
+def twist_name_to_display(name: str, parsed: dict = None) -> str:
+    """
+    Convert Twist-compatible name to human-readable display name.
+
+    Args:
+        name: Twist construct name
+        parsed: Optional pre-parsed name dict
+    """
+    if parsed is None:
+        parsed = parse_twist_name(name)
+
+    parts = []
+
+    # Protein name (apply naming rules)
+    protein = parsed.get('protein', '')
+    if protein:
+        # Apply protein name replacements
+        display_protein = NAMING_RULES.get(protein, protein.replace('_', ' '))
+        parts.append(display_protein)
+
+    # Signal peptide suffix (only if notable)
+    signal = parsed.get('signal')
+    if signal and signal != 's5':  # s5 is common, don't suffix
+        signal_name = NAMING_RULES.get(signal, signal)
+        if signal_name:
+            parts.append(f"({signal_name})")
+
+    # Codon variant suffix
+    codon = parsed.get('codon')
+    if codon and codon != 'b':
+        codon_suffix = NAMING_RULES.get(codon, f" {codon}")
+        parts.append(codon_suffix.strip())
+
+    # C-terminal tag
+    tag = parsed.get('tag')
+    if tag:
+        tag_name = NAMING_RULES.get(tag, tag)
+        parts.append(f"-{tag_name}")
+
+    return ' '.join(parts).strip()
+
+
+def analyze_construct(construct: TwistConstruct) -> TwistConstruct:
+    """
+    Analyze a Twist construct to detect signal peptides, tags, and validate ORF.
+
+    Modifies construct in place and returns it.
+    """
+    # Parse the Twist name
+    parsed = parse_twist_name(construct.name)
+    construct.codon_variant = parsed.get('codon')
+    construct.protein_name = parsed.get('protein')
+    construct.c_terminal_tag = parsed.get('tag')
+
+    # Validate the insert sequence as an ORF
+    is_valid, protein, error = validate_orf(construct.insert_sequence)
+    if not is_valid:
+        print(f"Warning: {construct.name}: {error}")
+        return construct
+
+    # Detect signal peptide from sequence (more reliable than name parsing)
+    signal_result = detect_signal_peptide(protein)
+    if signal_result:
+        signal_key, _ = signal_result
+        construct.signal_type = signal_key
+    else:
+        # Check if name indicates signal that we didn't detect
+        name_signal = parsed.get('signal')
+        if name_signal:
+            print(f"Warning: {construct.name}: Name indicates {name_signal} signal but not detected in sequence")
+        construct.signal_type = None
+
+    # Generate display name
+    construct.display_name = twist_name_to_display(construct.name, parsed)
+
+    # Generate ORF name (protein name with tag)
+    orf_parts = [parsed.get('protein', 'ORF').replace('_', ' ')]
+    if construct.c_terminal_tag:
+        tag_name = NAMING_RULES.get(construct.c_terminal_tag, construct.c_terminal_tag)
+        orf_parts.append(f"-{tag_name}")
+    construct.orf_name = ''.join(orf_parts)
+
+    return construct
+
+
+def read_twist_csv(csv_path: str, skip_failed: bool = True) -> list:
+    """
+    Read constructs from a Twist CSV file.
+
+    Args:
+        csv_path: Path to the CSV file
+        skip_failed: If True, skip constructs with status "failed"
+
+    Returns:
+        List of TwistConstruct objects
+    """
+    import csv
+
+    constructs = []
+    with open(csv_path, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            status = row.get('Step', '').lower()
+            if skip_failed and status == 'failed':
+                continue
+
+            construct = TwistConstruct(
+                name=row['Name'],
+                vector_name=row['Vector name'],
+                insert_sequence=row['Insert sequence'].upper(),
+                construct_sequence=row['Construct sequence'].upper(),
+                insert_length=int(row['Insert length']),
+                construct_length=int(row['Construct length']),
+                status=status,
+                shipping_est=row.get('Shipping est', ''),
+            )
+
+            # Analyze the construct
+            analyze_construct(construct)
+            constructs.append(construct)
+
+    return constructs
+
+
+def process_twist_csv(
+    csv_path: str,
+    output_dir: str = None,
+    skip_failed: bool = True,
+    dry_run: bool = False,
+) -> list:
+    """
+    Process a Twist CSV file and generate SnapGene .dna files.
+
+    Args:
+        csv_path: Path to the Twist CSV file
+        output_dir: Directory for output files (default: same as CSV)
+        skip_failed: Skip constructs marked as "failed"
+        dry_run: If True, analyze but don't generate files
+
+    Returns:
+        List of (construct, output_path or None) tuples
+    """
+    if output_dir is None:
+        output_dir = os.path.dirname(csv_path) or '.'
+
+    constructs = read_twist_csv(csv_path, skip_failed=skip_failed)
+    results = []
+
+    print(f"Processing {len(constructs)} constructs from {csv_path}")
+    print("=" * 60)
+
+    for construct in constructs:
+        print(f"\n{construct.name}:")
+        print(f"  Vector: {construct.vector_name}")
+        print(f"  Signal: {construct.signal_type or 'none'}")
+        print(f"  Protein: {construct.protein_name}")
+        print(f"  Tag: {construct.c_terminal_tag or 'none'}")
+        print(f"  Display name: {construct.display_name}")
+        print(f"  ORF name: {construct.orf_name}")
+        print(f"  Insert length: {construct.insert_length} bp")
+
+        if dry_run:
+            results.append((construct, None))
+            continue
+
+        # Look up vector configuration
+        # Try both exact match and normalized name
+        vector_key = construct.vector_name.replace(' ', '_')
+        if vector_key not in VECTORS:
+            print(f"  ERROR: Vector '{construct.vector_name}' not in VECTORS registry")
+            results.append((construct, None))
+            continue
+
+        vector = VECTORS[vector_key]
+
+        # Resolve signal peptide
+        signal = None
+        if construct.signal_type and construct.signal_type in SECRETION_SIGNALS:
+            signal = SECRETION_SIGNALS[construct.signal_type]
+
+        # Generate output path
+        output_filename = f"{construct.display_name or construct.name}.dna"
+        output_path = os.path.join(output_dir, output_filename)
+
+        try:
+            generate_from_vector(
+                vector_name=vector_key,
+                final_sequence=construct.construct_sequence,
+                construct_name=construct.display_name or construct.name,
+                orf_name=construct.orf_name or "ORF",
+                signal_peptide=signal,
+                output_path=output_path,
+            )
+            print(f"  Generated: {output_path}")
+            results.append((construct, output_path))
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            results.append((construct, None))
+
+    return results
+
+
 def list_vectors():
     """Print available vectors and their configurations."""
     print("Available vectors:")
@@ -981,6 +1402,8 @@ def list_vectors():
 
 def list_signals():
     """Print available secretion signals."""
+    print(f"Configuration file: {CONFIG_FILE}")
+    print()
     print("Available secretion signals:")
     print("-" * 60)
     for key, sig in SECRETION_SIGNALS.items():
@@ -988,6 +1411,11 @@ def list_signals():
         print(f"    Name: {sig.name}")
         print(f"    Sequence: {sig.aa_sequence}")
         print()
+    print("Available tags:")
+    print("-" * 60)
+    for key, seq in TAGS.items():
+        print(f"  {key}: {seq}")
+    print()
 
 
 def main():
@@ -997,7 +1425,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Generate using a registered vector (recommended)
+  # Process a Twist CSV file (dry run first to check)
+  %(prog)s --csv "Lytos FTE3.csv" --dry-run
+
+  # Process CSV and generate .dna files
+  %(prog)s --csv "Lytos FTE3.csv" --output-dir ./output
+
+  # Generate a single construct using a registered vector
   %(prog)s --vector pJAG_v2 --sequence ATGCAG... --name "My Protein"
 
   # Read sequence from file
@@ -1021,7 +1455,17 @@ Environment:
     parser.add_argument("--list-signals", action="store_true",
                         help="List available secretion signals")
 
-    # Main parameters
+    # CSV import mode
+    parser.add_argument("--csv", metavar="FILE",
+                        help="Process a Twist CSV file")
+    parser.add_argument("--output-dir", metavar="DIR",
+                        help="Output directory for generated .dna files")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Analyze CSV without generating files")
+    parser.add_argument("--include-failed", action="store_true",
+                        help="Include failed constructs from CSV")
+
+    # Single construct mode
     parser.add_argument("--vector", "-v", metavar="NAME",
                         help=f"Vector name (available: {', '.join(VECTORS.keys())})")
     parser.add_argument("--sequence", "-s", metavar="SEQ",
@@ -1048,7 +1492,27 @@ Environment:
         list_signals()
         return
 
-    # Validate required arguments for generation
+    # CSV import mode
+    if args.csv:
+        results = process_twist_csv(
+            csv_path=args.csv,
+            output_dir=args.output_dir,
+            skip_failed=not args.include_failed,
+            dry_run=args.dry_run,
+        )
+        # Print summary
+        success = sum(1 for _, path in results if path is not None)
+        failed = sum(1 for _, path in results if path is None)
+        print(f"\n{'=' * 60}")
+        if args.dry_run:
+            print(f"Dry run complete: {len(results)} constructs analyzed")
+        else:
+            print(f"Generated: {success} files")
+            if failed > 0:
+                print(f"Failed: {failed} constructs")
+        return
+
+    # Single construct mode - validate required arguments
     if not args.vector:
         parser.error("--vector is required for generation")
     if not args.name:

@@ -1,0 +1,122 @@
+{
+  "_comment": "Secretion signals and affinity tags for twist_to_snapgene.py",
+  "_updated": "2025-01-19",
+
+  "secretion_signals": {
+    "_comment": "Order matters: longer/more specific signals are checked first",
+
+    "s3": {
+      "name": "s3 prepro signal",
+      "sequence": "MRQVWFSWIVGLFLCFFNVSSAAPVNTTTEDETAQIPAEAVIGYLDLEGDFDVAVLPFSNSTNNGLLFINTTIASIAAKEEGVSLDKREAEA",
+      "short_name": "s3",
+      "color": "#3366ff",
+      "description": "OST1 signal (22 aa) + alpha factor pro-peptide (92 aa total)"
+    },
+    "s1": {
+      "name": "alpha factor prepro",
+      "sequence": "MRFPSIFTAVLFAASSALAAPVNTTTEDETAQIPAEAVIGYLDLEGDFDVAVLPFSNSTNNGLLFINTTIASIAAKEEGVSLDKREAEA",
+      "short_name": "s1",
+      "color": "#3366ff",
+      "description": "Alpha factor signal (19 aa) + pro-peptide, ends at KREAEA (89 aa total)"
+    },
+    "s2": {
+      "name": "s2 prepro signal",
+      "sequence": "MRFPSIFTAVLFAASSALAAPVNTTTEDETAQIPAEAVIGYLDLEGDFDVAVLPFSNSTNNGLLFINTTIASIAAKEEGVSLDKR",
+      "short_name": "s2",
+      "color": "#3366ff",
+      "description": "Alpha factor signal + shorter pro-peptide, ends at KR (85 aa total)"
+    },
+    "s4": {
+      "name": "Sc OST1 signal peptide",
+      "sequence": "MRQVWFSWIVGLFLCFFNVSSA",
+      "short_name": "s4",
+      "color": "#3366ff",
+      "description": "OST1 signal peptide only, no pro-peptide (22 aa)"
+    },
+    "s5": {
+      "name": "Sc AGA2 signal peptide",
+      "sequence": "MQLLRCFSIFSVIASVLA",
+      "short_name": "s5",
+      "color": "#3366ff",
+      "description": "AGA2 signal peptide, no pro-peptide (18 aa)"
+    },
+    "alpha_factor": {
+      "name": "alpha factor signal",
+      "sequence": "MRFPSIFTAVLFAASSALA",
+      "short_name": "alpha factor",
+      "color": "#3366ff",
+      "description": "Alpha factor signal peptide only (19 aa)"
+    },
+    "hsa": {
+      "name": "HSA signal sequence",
+      "sequence": "MKWVTFISLLFLFSSAYS",
+      "short_name": "hsa",
+      "color": "#3366ff",
+      "description": "Human Serum Albumin signal for mammalian proteins (18 aa)"
+    }
+  },
+
+  "tags": {
+    "6xHis": {
+      "sequence": "HHHHHH",
+      "description": "Nickel/cobalt affinity purification"
+    },
+    "8xHis": {
+      "sequence": "HHHHHHHH",
+      "description": "Extended His tag"
+    },
+    "FLAG": {
+      "sequence": "DYKDDDDK",
+      "description": "Immunoprecipitation, Western blot"
+    },
+    "V5": {
+      "sequence": "GKPIPNPLLGLDST",
+      "description": "Detection, Western blot"
+    },
+    "Myc": {
+      "sequence": "EQKLISEEDL",
+      "description": "Detection, IP"
+    },
+    "HA": {
+      "sequence": "YPYDVPDYA",
+      "description": "Hemagglutinin epitope, detection"
+    },
+    "Strep": {
+      "sequence": "WSHPQFEK",
+      "description": "Strep-Tactin purification"
+    },
+    "StrepII": {
+      "sequence": "SAWSHPQFEK",
+      "description": "Strep-tag II"
+    }
+  },
+
+  "naming_rules": {
+    "_comment": "Rules for converting Twist names to display names",
+
+    "signals": {
+      "s1": "s1",
+      "s2": "s2",
+      "s3": "s3",
+      "s4": "s4",
+      "s5": "",
+      "hsa": "HSA",
+      "na": ""
+    },
+    "codon_variants": {
+      "b": "",
+      "c": "(alt codon)"
+    },
+    "tags": {
+      "6xH": "6xHis",
+      "6xHis": "6xHis",
+      "FLAG": "FLAG",
+      "V5": "V5",
+      "HA": "HA"
+    },
+    "proteins": {
+      "Phi_Ea1h": "Phi Ea1h",
+      "EL_PH1": "EL PH1"
+    }
+  }
+}
