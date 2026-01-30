@@ -56,13 +56,20 @@ end open
 on findDNAFiles(folderPath)
     set dnaFiles to {}
     try
-        tell application "System Events"
-            set theFolder to folder folderPath
-            set allFiles to files of theFolder whose name ends with ".dna"
-            repeat with f in allFiles
-                set end of dnaFiles to (POSIX file (POSIX path of (path of f))) as alias
+        -- Use find with pipe delimiter (do shell script strips newlines)
+        set shellCmd to "find " & quoted form of folderPath & " -maxdepth 1 -name '*.dna' -type f 2>/dev/null | tr '\\n' '|'"
+        set fileList to do shell script shellCmd
+        if fileList is not "" then
+            set oldDelims to AppleScript's text item delimiters
+            set AppleScript's text item delimiters to "|"
+            set fileLines to text items of fileList
+            set AppleScript's text item delimiters to oldDelims
+            repeat with filePath in fileLines
+                if filePath is not "" then
+                    set end of dnaFiles to (POSIX file filePath) as alias
+                end if
             end repeat
-        end tell
+        end if
     end try
     return dnaFiles
 end findDNAFiles
