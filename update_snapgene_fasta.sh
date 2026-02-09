@@ -10,6 +10,9 @@ DATE=$(date +%Y-%m-%d)
 NEW_FILE="${SNAPGENE_DIR}/${DATE}-snapgene-collection.fa"
 LOG_FILE="${SCRIPT_DIR}/snapgene_fasta.log"
 
+# Wait for Dropbox to be ready after wake
+sleep 300
+
 # Log start
 echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting FASTA update" >> "$LOG_FILE"
 
